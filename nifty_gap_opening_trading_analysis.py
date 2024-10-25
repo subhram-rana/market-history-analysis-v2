@@ -34,11 +34,15 @@ class TradeConfig:
             fixed_sl_points: int,
             target_type: str,
             fixed_target_points: int,
+            entry_time: str,
+            max_wait_in_minutes: int,
     ):
         self.gap_threshold = gap_threshold
         self.fixed_sl_points = fixed_sl_points
         self.target_type = target_type
         self.fixed_target_points = fixed_target_points
+        self.entry_time = entry_time
+        self.max_wait_in_minutes = max_wait_in_minutes
 # ------------------------------------------
 # ------------------------------------------
 
@@ -152,7 +156,7 @@ class TradingSummary:
 def clean_worksheet(ws):
     # 1. trades
     for row in range(2, 1000):
-        for col in range(1, 7):
+        for col in range(1, 8):
             cell = ws.cell(row=row, column=col)
             cell.value = None
 
@@ -186,6 +190,7 @@ def write_to_sheet(
 
         # 1. trades
         cur_row = 2
+        cumulative_points_gained = 0
         for trade in trades:
             ws.cell(row=cur_row, column=1, value=trade.day.strftime(date_str_format))
             ws.cell(row=cur_row, column=2, value=trade.gap)
@@ -197,6 +202,9 @@ def write_to_sheet(
                 ws.cell(row=cur_row, column=5, value=trade.exit_time.strftime(time_str_format))
 
             ws.cell(row=cur_row, column=6, value=trade.points_gained)
+
+            cumulative_points_gained += trade.points_gained if trade.points_gained != '' else 0
+            ws.cell(row=cur_row, column=7, value=cumulative_points_gained)
 
             cur_row += 1
 
@@ -223,6 +231,8 @@ def get_trades_and_summary(
         gap_threshold: int,
         fixed_sl_points: int,
         fixed_target_points: int,
+        entry_time: str,
+        max_wait_in_minutes: int,
 ) -> (List[Trade], TradingSummary):
     candlestick_data: UpstoxCandlestickResponse = fetch_candlestick_data_from_upstox(
         unique_instrument_token,
@@ -243,20 +253,21 @@ def get_trades_and_summary(
         next_candle = candles[i+1]
 
         if cur_candle.date != prev_candle.date:
-            # taking 9:16 am candle for considering gap opening not 9:15
-            gap = next_candle.open - prev_candle.close
+            if entry_time == "9:15":
+                gap = cur_candle.open - prev_candle.close
+                entry_point = cur_candle.open
+                j = i
+            elif entry_time == "9:16":
+                gap = next_candle.open - prev_candle.close
+                entry_point = next_candle.open
+                j = i + 1
+            else:
+                raise Exception(f'invalid entry time: {entry_time}')
+
             trade = Trade(
                 day=cur_candle.ts.date(),
                 gap=gap,
             )
-
-            # entry at 9:16 am
-            entry_point = next_candle.open
-            j = i+1
-
-            # entry at 9:15 am
-            # entry_point = cur_candle.open
-            # j = i
 
             if gap >= abs(gap_threshold):
                 # take short entry
@@ -274,8 +285,14 @@ def get_trades_and_summary(
                         trade.points_gained = fixed_target_points
                         trade.trading_status = ''
                         break
-                    else:
-                        j += 1
+                    elif j-i > max_wait_in_minutes:
+                        # Target hit
+                        trade.exit_time = candles[j].ts.time()
+                        trade.points_gained = candles[i].open - candles[j].open
+                        trade.trading_status = ''
+                        break
+
+                    j += 1
             elif gap <= -1 * abs(gap_threshold):
                 # take long entry
                 trade.entry_time = candles[j].ts.time()
@@ -292,8 +309,14 @@ def get_trades_and_summary(
                         trade.points_gained = fixed_target_points
                         trade.trading_status = ''
                         break
-                    else:
-                        j += 1
+                    elif j - i > max_wait_in_minutes:
+                        # Target hit
+                        trade.exit_time = candles[j].ts.time()
+                        trade.points_gained = candles[j].open - candles[i].open
+                        trade.trading_status = ''
+                        break
+
+                    j += 1
 
             trades.append(trade)
 
@@ -307,6 +330,8 @@ def main(trade_config: TradeConfig):
         trade_config.gap_threshold,
         trade_config.fixed_sl_points,
         trade_config.fixed_target_points,
+        trade_config.entry_time,
+        trade_config.max_wait_in_minutes,
     )
 
     write_to_sheet(trades, trade_config, trading_summary)
@@ -316,6 +341,8 @@ def optimization() -> TradeConfig:
     gap_threshold_range = list(range(30, 201, 10))
     fixed_sl_points_range = list(range(20, 41, 5))
     fixed_target_points_range = list(range(30, 81, 5))
+    entry_times = ["9:15"]
+    max_wait_in_minutes = 120
 
     max_tot_gain = -10000000
     optimized_trade_config = None
@@ -323,20 +350,25 @@ def optimization() -> TradeConfig:
     for gap_threshold in gap_threshold_range:
         for fixed_sl_points in fixed_sl_points_range:
             for fixed_target_points in fixed_target_points_range:
-                trades, trading_summary = get_trades_and_summary(
-                    gap_threshold,
-                    fixed_sl_points,
-                    fixed_target_points,
-                )
-
-                if max_tot_gain < trading_summary.tot_gain:
-                    max_tot_gain = trading_summary.tot_gain
-                    optimized_trade_config = TradeConfig(
-                        gap_threshold=gap_threshold,
-                        fixed_sl_points=fixed_sl_points,
-                        target_type='fixed',
-                        fixed_target_points=fixed_target_points,
+                for entry_time in entry_times:
+                    trades, trading_summary = get_trades_and_summary(
+                        gap_threshold,
+                        fixed_sl_points,
+                        fixed_target_points,
+                        entry_time,
+                        max_wait_in_minutes,
                     )
+
+                    if max_tot_gain < trading_summary.tot_gain:
+                        max_tot_gain = trading_summary.tot_gain
+                        optimized_trade_config = TradeConfig(
+                            gap_threshold=gap_threshold,
+                            fixed_sl_points=fixed_sl_points,
+                            target_type='fixed',
+                            fixed_target_points=fixed_target_points,
+                            entry_time=entry_time,
+                            max_wait_in_minutes=max_wait_in_minutes,
+                        )
 
     return optimized_trade_config
 
@@ -344,19 +376,26 @@ def optimization() -> TradeConfig:
 if __name__ == '__main__':
     # manual optimisation and testing
     # main(TradeConfig(
-    #     gap_threshold=80,
+    #     gap_threshold=70,
     #     fixed_sl_points=40,
     #     target_type='fixed',
     #     fixed_target_points=80,
+    #     entry_time="9:15",
+    #     max_wait_in_minutes=120,
     # ))
 
     # most optimised one as per "tot_gain"
     main(TradeConfig(
-        gap_threshold=70,
-        fixed_sl_points=40,
+        gap_threshold=30,
+        fixed_sl_points=30,
         target_type='fixed',
-        fixed_target_points=80,
+        fixed_target_points=65,
+        entry_time="9:15",
+        max_wait_in_minutes=120,
     ))
 
-    optimised_trade_config: TradeConfig = optimization()
-    print(optimised_trade_config.__dict__)
+    # -------------------- IMPORTANT --------------------
+    # Uncomment only of you wanna run OPTIMISATION
+    # -------------------- -------------------- ---------
+    # optimised_trade_config: TradeConfig = optimization()
+    # print(optimised_trade_config.__dict__)
